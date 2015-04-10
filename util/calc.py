@@ -41,26 +41,26 @@ def find_stream(stream_key, streams, distinct_sensors):
 
 
 @log_timing
-def get_particles(streams, start, stop, coefficients):
+def get_particles(streams, start, stop, coefficients,limit = None):
     stream_keys = [StreamKey.from_dict(d) for d in streams]
     parameters = []
     for s in streams:
         for p in s.get('parameters', []):
             parameters.append(CachedParameter.from_id(p))
     time_range = TimeRange(start, stop)
-    stream_request = StreamRequest(stream_keys, parameters, coefficients, time_range)
+    stream_request = StreamRequest(stream_keys, parameters, coefficients, time_range, limit = limit)
     return stream_request.particle_generator()
 
 
 @log_timing
-def get_netcdf(streams, start, stop, coefficients):
+def get_netcdf(streams, start, stop, coefficients,limit = None):
     stream_keys = [StreamKey.from_dict(d) for d in streams]
     parameters = []
     for s in streams:
         for p in s.get('parameters', []):
             parameters.append(CachedParameter.from_id(p))
     time_range = TimeRange(start, stop)
-    stream_request = StreamRequest(stream_keys, parameters, coefficients, time_range)
+    stream_request = StreamRequest(stream_keys, parameters, coefficients, time_range, limit = limit)
     return stream_request.netcdf_generator()
 
 
@@ -203,6 +203,7 @@ class DataStream(object):
         self.func_params = []
         self.times = []
         self.needs_cc = []
+        self.terminate = False
         self._initialize()
 
     def _initialize(self):
@@ -222,11 +223,14 @@ class DataStream(object):
         self.future.add_callbacks(callback=self.handle_page, errback=self.handle_error)
 
     def handle_page(self, rows):
+        app.logger.info("ROWS NUMBERING {}".format(len(rows)))
         self.queue.put(rows)
-        if self.future.has_more_pages:
+        if self.future.has_more_pages and not self.terminate:
             self.future.start_fetching_next_page()
         else:
             self.finished_event.set()
+    def terminate_query(self):
+        self.terminate = True
 
     def handle_error(self, exc):
         self.error = exc
@@ -335,7 +339,7 @@ class DataStream(object):
 
 
 class StreamRequest(object):
-    def __init__(self, stream_keys, parameters, coefficients, time_range, needs_only=False):
+    def __init__(self, stream_keys, parameters, coefficients, time_range, needs_only=False,limit = None):
         self.stream_keys = stream_keys
         self.time_range = time_range
         self.parameters = parameters
@@ -343,6 +347,7 @@ class StreamRequest(object):
         self.streams = []
         self.needs_cc = None
         self.needs_params = None
+        self.limit = limit
         self._initialize(needs_only)
 
     def _initialize(self, needs_only):
@@ -429,6 +434,9 @@ class StreamRequest(object):
     def _query_all(self):
         for stream in self.streams:
             stream.async_query()
+    def _terminate_all(self):
+        for stream in self.streams:
+            stream.terminate_query()
 
     def _calculate(self, parameter, chunk):
         needs = [CachedParameter.from_id(p) for p in parameter.needs if p not in chunk.keys()]
@@ -482,17 +490,23 @@ class StreamRequest(object):
 
     def particle_generator(self):
         self._query_all()
+        count = 0
         yield '[ '
         first = True
         for chunk in self.streams[0].create_generator(None):
             self._execute_dpas_chunk(chunk)
             for particle in self.chunk_to_particles(chunk):
+                count += 1
                 if first:
                     first = False
                 else:
                     yield ', '
                 yield particle
+            if self.limit is not None :
+                if self.limit <= count :
+                    break
         yield ' ]'
+        self._terminate_all()
 
     def netcdf_generator(self):
         self._query_all()
